@@ -1,0 +1,169 @@
+# Unit tests for rules/node-pod-health.rules.yaml
+#
+#   promtool test rules tests/rules/node-pod-health.test.yaml
+#
+# How to read these tests:
+#   input_series  fake metric history. "1 1 0x10" means value 1 at minute 0,
+#                 1 at minute 1, then 0 for the next 10 minutes ("0x10").
+#   eval_time     the moment we ask "which alerts are FIRING now?"
+#   exp_alerts    exactly which alerts we expect (labels + rendered text).
+#                 An empty list means "nothing must fire" (e.g. still inside the `for:` window).
+
+rule_files:
+  - ../../rules/node-pod-health.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # -------------------------------------------------------------------------
+  - name: NodeNotReady fires only after 5 minutes of NotReady
+    interval: 1m
+    input_series:
+      - series: 'kube_node_status_condition{condition="Ready",status="true",node="node-1"}'
+        values: "1 1 0x10"   # goes NotReady at minute 2
+      - series: 'kube_node_status_condition{condition="Ready",status="true",node="node-2"}'
+        values: "1x12"       # healthy the whole time
+    alert_rule_test:
+      - eval_time: 4m        # NotReady for 2 minutes: pending, not firing yet
+        alertname: NodeNotReady
+        exp_alerts: []
+      - eval_time: 8m        # NotReady for 6 minutes: firing
+        alertname: NodeNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              condition: Ready
+              status: "true"
+              node: node-1
+            exp_annotations:
+              summary: "Node node-1 is not Ready"
+              description: "Node node-1 has reported NotReady for more than 5 minutes. Pods on it may be evicted."
+              runbook_url: "https://github.com/ngems1/terraform-k8s-monitoring-stack/blob/main/docs/RUNBOOKS.md#nodenotready"
+
+  # -------------------------------------------------------------------------
+  - name: NodeUnderPressure reports the pressure type
+    interval: 1m
+    input_series:
+      - series: 'kube_node_status_condition{condition="MemoryPressure",status="true",node="node-2"}'
+        values: "1x10"
+      - series: 'kube_node_status_condition{condition="DiskPressure",status="true",node="node-2"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: NodeUnderPressure
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              condition: MemoryPressure
+              status: "true"
+              node: node-2
+            exp_annotations:
+              summary: "Node node-2 has MemoryPressure"
+              description: "The kubelet on node-2 reports MemoryPressure; it will start evicting pods."
+              runbook_url: "https://github.com/ngems1/terraform-k8s-monitoring-stack/blob/main/docs/RUNBOOKS.md#nodeunderpressure"
+
+  # -------------------------------------------------------------------------
+  - name: NodeFilesystemAlmostFull ignores tmpfs and fires below 10%
+    interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{instance="node-1:9100",mountpoint="/",fstype="ext4",device="/dev/nvme0n1p1"}'
+        values: "5x20"
+      - series: 'node_filesystem_size_bytes{instance="node-1:9100",mountpoint="/",fstype="ext4",device="/dev/nvme0n1p1"}'
+        values: "100x20"
+      # tmpfs is RAM-backed and expected to be small: must NOT alert
+      - series: 'node_filesystem_avail_bytes{instance="node-1:9100",mountpoint="/dev/shm",fstype="tmpfs",device="tmpfs"}'
+        values: "1x20"
+      - series: 'node_filesystem_size_bytes{instance="node-1:9100",mountpoint="/dev/shm",fstype="tmpfs",device="tmpfs"}'
+        values: "100x20"
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: NodeFilesystemAlmostFull
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: "node-1:9100"
+              mountpoint: /
+              fstype: ext4
+              device: /dev/nvme0n1p1
+            exp_annotations:
+              summary: "Filesystem / on node-1:9100 below 10% free"
+              description: "Only 5% space left on / (node-1:9100)."
+              runbook_url: "https://github.com/ngems1/terraform-k8s-monitoring-stack/blob/main/docs/RUNBOOKS.md#nodefilesystemalmostfull"
+
+  # -------------------------------------------------------------------------
+  - name: PodCrashLooping fires for the crashing pod only
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_waiting_reason{namespace="shop",pod="api-1",container="api",reason="CrashLoopBackOff"}'
+        values: "1x20"
+      - series: 'kube_pod_container_status_waiting_reason{namespace="shop",pod="api-2",container="api",reason="CrashLoopBackOff"}'
+        values: "0x20"
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: PodCrashLooping
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: shop
+              pod: api-1
+              container: api
+              reason: CrashLoopBackOff
+            exp_annotations:
+              summary: "Pod shop/api-1 is crash looping"
+              description: "Container api in shop/api-1 keeps restarting (CrashLoopBackOff)."
+              runbook_url: "https://github.com/ngems1/terraform-k8s-monitoring-stack/blob/main/docs/RUNBOOKS.md#podcrashlooping"
+
+  # -------------------------------------------------------------------------
+  - name: PodNotRunning fires for a pod stuck in Pending
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_status_phase{namespace="shop",pod="worker-1",uid="u1",phase="Pending"}'
+        values: "1x20"
+      - series: 'kube_pod_status_phase{namespace="shop",pod="worker-1",uid="u1",phase="Running"}'
+        values: "0x20"
+      - series: 'kube_pod_status_phase{namespace="shop",pod="web-1",uid="u2",phase="Running"}'
+        values: "1x20"
+    alert_rule_test:
+      - eval_time: 10m       # stuck for 10 minutes: still inside the 15 minute window
+        alertname: PodNotRunning
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: PodNotRunning
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: shop
+              pod: worker-1
+              phase: Pending
+            exp_annotations:
+              summary: "Pod shop/worker-1 stuck in Pending"
+              description: "Pod shop/worker-1 has been Pending for more than 15 minutes."
+              runbook_url: "https://github.com/ngems1/terraform-k8s-monitoring-stack/blob/main/docs/RUNBOOKS.md#podnotrunning"
+
+  # -------------------------------------------------------------------------
+  - name: DeploymentReplicasMismatch waits 15 minutes before firing
+    interval: 1m
+    input_series:
+      - series: 'kube_deployment_spec_replicas{namespace="shop",deployment="web"}'
+        values: "3x20"
+      - series: 'kube_deployment_status_replicas_available{namespace="shop",deployment="web"}'
+        values: "3 3 1x18"   # drops to 1 available at minute 2
+      - series: 'kube_deployment_spec_replicas{namespace="shop",deployment="api"}'
+        values: "2x20"
+      - series: 'kube_deployment_status_replicas_available{namespace="shop",deployment="api"}'
+        values: "2x20"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: DeploymentReplicasMismatch
+        exp_alerts: []
+      - eval_time: 18m
+        alertname: DeploymentReplicasMismatch
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: shop
+              deployment: web
+            exp_annotations:
+              summary: "Deployment shop/web is missing replicas"
+              description: "Deployment shop/web has not had all of its desired replicas available for 15 minutes."
+              runbook_url: "https://github.com/ngems1/terraform-k8s-monitoring-stack/blob/main/docs/RUNBOOKS.md#deploymentreplicasmismatch"

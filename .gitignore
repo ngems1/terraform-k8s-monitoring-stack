@@ -1,0 +1,17 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+*.tfvars
+!*.tfvars.example
+
+# promtool binary downloaded by CI
+/promtool
+
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

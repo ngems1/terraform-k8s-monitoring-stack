@@ -1,0 +1,181 @@
+# Learn: Kubernetes monitoring with Prometheus, Grafana & Alertmanager (junior-friendly guide)
+
+This guide explains how the monitoring stack works and why the module is built the way it is. Read it with [`main.tf`](../main.tf) open beside it.
+
+---
+
+## 1. The three questions monitoring answers
+
+| Question | Tool | Example |
+|---|---|---|
+| **What is happening right now, and what happened before?** | **Prometheus** stores numbers over time ("metrics") | CPU of node-1 at 14:02 was 73% |
+| **Can I see it?** | **Grafana** draws dashboards from those numbers | "Cluster health" dashboard |
+| **Will someone be told when it breaks?** | **Prometheus rules** detect problems; **Alertmanager** notifies people | "Node node-1 is not Ready" → Slack + PagerDuty |
+
+---
+
+## 2. How the pieces fit together
+
+```
+   ┌─────────────── each node ───────────────┐
+   │ node-exporter  (CPU, memory, disk)      │──┐
+   │ kubelet        (containers, volumes)    │──┤   Prometheus PULLS ("scrapes")
+   └─────────────────────────────────────────┘  │   /metrics every 30 seconds
+   kube-state-metrics (pods, deployments, ...)  ├──► ┌────────────┐   rules    ┌──────────────┐  Slack
+   your apps (ServiceMonitor)                   ┘    │ Prometheus │ ─────────► │ Alertmanager │─ PagerDuty
+                                                     └─────┬──────┘  firing    └──────────────┘
+                                                           │ PromQL
+                                                     ┌─────▼──────┐
+                                                     │  Grafana   │  dashboards
+                                                     └────────────┘
+   Prometheus Operator: watches ServiceMonitor / PrometheusRule objects and reconfigures Prometheus for you
+```
+
+| Component | Role |
+|---|---|
+| **node-exporter** | A DaemonSet (one pod per node) exposing hardware and OS metrics: `node_cpu_seconds_total`, `node_filesystem_avail_bytes`… |
+| **kube-state-metrics** | Turns the *state* of Kubernetes objects into metrics: `kube_pod_status_phase`, `kube_node_status_condition`… |
+| **Prometheus** | Scrapes all of the above, stores time series on disk, evaluates alert rules every 30 s |
+| **Alertmanager** | Receives firing alerts, **groups** them (one message for 10 related alerts), **deduplicates**, **silences**, and **routes** them to Slack or PagerDuty |
+| **Grafana** | Dashboards and graphs. It only *reads* from Prometheus. |
+| **Prometheus Operator** | Lets you configure monitoring with Kubernetes objects (`ServiceMonitor`, `PrometheusRule`) instead of editing config files |
+
+The community packages all of this as one Helm chart, **kube-prometheus-stack**. This module installs that chart with good defaults for each cloud.
+
+---
+
+## 3. Reading an alert rule (PromQL)
+
+```yaml
+- alert: NodeNotReady
+  expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+  for: 5m
+  labels:
+    severity: critical
+```
+
+| Part | Meaning |
+|---|---|
+| `kube_node_status_condition` | A metric from kube-state-metrics: 1 if the node has the condition, otherwise 0 |
+| `{condition="Ready",status="true"}` | **Label filter**: only the "is Ready" series |
+| `== 0` | Keep only nodes where Ready is false. **Every series that survives is an alert.** |
+| `for: 5m` | It must stay true for 5 minutes before firing. This avoids paging on short blips (state *pending*, then *firing*). |
+| `severity: critical` | Used by Alertmanager to decide who gets notified |
+
+More PromQL used in [`rules/node-pod-health.rules.yaml`](../rules/node-pod-health.rules.yaml):
+
+| Expression | Meaning |
+|---|---|
+| `rate(node_cpu_seconds_total{mode="idle"}[5m])` | Idle CPU-seconds per second over 5 min, which is the fraction of time idle |
+| `1 - avg by (instance)(...)` | Busy fraction, averaged across a node's cores |
+| `predict_linear(x[6h], 24*3600) < 0` | "If the last 6 hours' trend continues, x hits zero within 24 hours" |
+| `max_over_time(x[5m])` | Highest value in the last 5 minutes, so short dips don't reset the alert |
+| `a and ignoring(reason) b` | Keep series from `a` that also exist in `b`, ignoring the `reason` label when matching |
+
+### Testing alerts like code
+
+[`tests/rules/node-pod-health.test.yaml`](../tests/rules/node-pod-health.test.yaml) feeds **fake metric history** into the rules and checks which alerts fire, when, and with what text:
+
+```yaml
+input_series:
+  - series: 'kube_node_status_condition{condition="Ready",status="true",node="node-1"}'
+    values: "1 1 0x10"   # Ready, Ready, then NotReady for 10 minutes
+alert_rule_test:
+  - eval_time: 4m        # NotReady for only 2 minutes: inside the 5m "for" window
+    alertname: NodeNotReady
+    exp_alerts: []       # so nothing may fire yet
+```
+
+Run them with `promtool test rules tests/rules/*.test.yaml`. CI does this on every pull request.
+
+---
+
+## 4. Why the module is built this way
+
+### 4.1 Helm values generated by Terraform
+
+The chart is configured through a big YAML document of **values**. The module builds that document as a Terraform object (`local.helm_values`) and turns it into YAML with `yamlencode()`. Advantages:
+
+- the values can use variables and conditions (per-cloud defaults);
+- tests can `yamldecode()` them back and **assert** on them, with no cluster needed.
+
+### 4.2 Rules through the chart, not `kubernetes_manifest`
+
+A tempting approach is to create the `PrometheusRule` object with Terraform's `kubernetes_manifest`. On a **fresh cluster** that fails: `kubernetes_manifest` needs the PrometheusRule **CRD** (custom resource definition) at *plan* time, but the CRD is only installed *by* the chart. The module passes the rules through the chart's `additionalPrometheusRulesMap` value instead, so everything installs in **one** `terraform apply`.
+
+### 4.3 Managed clusters hide the control plane
+
+On EKS, AKS and GKE the cloud provider runs the API server, scheduler, controller-manager and etcd, and you can't scrape them. If the chart tried, you would get `KubeSchedulerDown` and similar alerts **forever**: alert fatigue on day one. The module turns those targets and their rules off for managed clouds and keeps them for `generic` (self-managed) clusters.
+
+### 4.4 Per-cloud storage
+
+Prometheus needs a **persistent volume**, otherwise all history is lost when the pod restarts:
+
+| Cloud | StorageClass | Note |
+|---|---|---|
+| EKS | `gp3` (created by the module, encrypted) | EKS ships only `gp2`, which is older and costs more per GB |
+| AKS | `managed-csi` | Azure Disk via the CSI driver |
+| GKE | `standard-rwo` | Balanced persistent disk |
+| generic | cluster default | e.g. `standard` on kind |
+
+`retentionSize` is set to 90% of the volume, so Prometheus deletes old data **before** the disk fills.
+
+### 4.5 Security choices
+
+- **No default password.** The chart's well-known default Grafana login (`admin` / `prom-operator`) is replaced by a random 32-character password stored in a Kubernetes Secret. The e2e test checks that the default no longer works.
+- **Not exposed by default.** Grafana is only reachable via `kubectl port-forward` unless you enable an Ingress with TLS.
+- **Pod Security labels.** The namespace allows `privileged` pods only because node-exporter needs host access. On GKE Autopilot, where node-exporter is disabled, it's `baseline`.
+- **Secrets in sensitive variables.** The Slack webhook and PagerDuty key never appear in plan output.
+
+### 4.6 Alertmanager routing
+
+```
+all alerts ──► group by alertname, namespace, severity (wait 30s to batch)
+   ├─ Watchdog / InfoInhibitor ─► "null"      (dropped: Watchdog always fires on purpose)
+   ├─ severity = critical       ─► "critical"  (Slack + PagerDuty)
+   └─ everything else           ─► "default"   (Slack)
+inhibit: a firing critical alert mutes warning alerts with the same alertname/namespace/instance
+```
+
+> **Watchdog** is an alert that *always* fires. Advanced setups send it to an external "dead man's switch" (e.g. Healthchecks.io). If it stops arriving, the monitoring itself is broken.
+
+---
+
+## 5. Try it on your laptop
+
+```bash
+kind create cluster --name monitoring
+cd examples/kind
+terraform init && terraform apply
+terraform output -raw grafana_admin_password
+kubectl -n monitoring port-forward svc/monitoring-stack-grafana 3000:80
+# http://localhost:3000 -> Dashboards -> "Cluster health (nodes & pods)"
+```
+
+Make an alert fire:
+
+```bash
+kubectl create deployment crasher --image=busybox -- sh -c 'exit 1'   # PodCrashLooping in ~10 min
+kubectl -n monitoring port-forward svc/monitoring-stack-prometheus 9090:9090
+# http://localhost:9090/alerts
+```
+
+---
+
+## 6. Exercises
+
+1. Add an alert `PodHighRestartRate`: more than 5 restarts in an hour. Write the rule **and** a promtool unit test for it.
+2. Add a Grafana panel to `dashboards/cluster-health.json` showing memory usage per namespace (`sum by (namespace) (container_memory_working_set_bytes{container!=""})`).
+3. Route all alerts from namespace `payments` to a different Slack channel. *(Hint: a new route with `matchers = ["namespace = \"payments\""]` above the critical route, plus a new receiver.)*
+4. Why does `NodeFilesystemFillingUp` also require `< 0.4` free? What would happen without it?
+5. Set `prometheus_replicas = 2`. What changes, and what does it cost?
+
+---
+
+## 7. Further reading
+
+- [Prometheus: querying basics (PromQL)](https://prometheus.io/docs/prometheus/latest/querying/basics/)
+- [Prometheus: alerting rules](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/) and [unit testing rules](https://prometheus.io/docs/prometheus/latest/configuration/unit_testing_rules/)
+- [Alertmanager configuration](https://prometheus.io/docs/alerting/latest/configuration/)
+- [kube-prometheus-stack chart](https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack)
+- [Google SRE book: Monitoring distributed systems](https://sre.google/sre-book/monitoring-distributed-systems/)

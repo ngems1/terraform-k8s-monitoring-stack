@@ -1,0 +1,4 @@
+subscription_id     = "00000000-0000-0000-0000-000000000000"
+resource_group_name = "rg-prod-aks"
+cluster_name        = "prod-aks"
+# slack_webhook_url = "https://hooks.slack.com/services/..."   # better: export TF_VAR_slack_webhook_url

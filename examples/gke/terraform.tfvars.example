@@ -1,0 +1,5 @@
+project_id   = "acme-prod"
+location     = "us-central1"
+cluster_name = "prod-gke"
+autopilot    = false
+# slack_webhook_url = "https://hooks.slack.com/services/..."   # better: export TF_VAR_slack_webhook_url
