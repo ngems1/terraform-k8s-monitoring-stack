@@ -267,5 +267,3 @@ Defined in [`rules/node-pod-health.rules.yaml`](rules/node-pod-health.rules.yaml
 ## License
 
 [MIT](LICENSE)
-#   t e r r a f o r m - k 8 s - m o n i t o r i n g - s t a c k  
- 
